@@ -110,7 +110,7 @@ def get_footprint_text_items(footprint):
 
 
 class PrjData:
-    def __init__(self, board, dont_parse_schematics=False):
+    def __init__(self, board, dont_parse_schematics=True):
         self.board = board
 
         self.level = None
@@ -146,6 +146,7 @@ class PrjData:
             sheet_id = self.get_sheet_id(fp)
             try:
                 sheet_file = fp.GetProperty('Sheetfile')
+
                 sheet_name = fp.GetProperty('Sheetname')
             except KeyError:
                 logger.info("Footprint " + fp.GetReference() +
@@ -652,7 +653,39 @@ class RestoreLayout:
 
         self.dst_anchor_fp = self.prj_data.get_fp_by_ref(dst_anchor_fp_ref)
 
-    def restore_layout(self, layout_file):
+    def restore_layout(self, matched_layers):
+        logger.info("Restoring saved design")
+        matched_layerIDs ={}
+        for src_layer,dst_layer in matched_layers.items():
+            src_ID = self.saved_board.GetLayerID(src_layer)
+            dst_ID = self.board.GetLayerID(dst_layer)
+            matched_layerIDs[src_ID] = dst_ID
+        
+        # Create Group for placed components
+        layout_group = pcbnew.PCB_GROUP(self.board)
+        self.board.Add(layout_group)
+
+        # replicate modules
+        src_anchor_fp = self.saved_fps[self.footprints_to_place.index(self.dst_anchor_fp)]
+        self.replicate_footprints(src_anchor_fp, self.saved_fps, self.dst_anchor_fp, self.footprints_to_place, layout_group)
+
+        # replicate tracks ADD MATCHED LAYER DICT
+        self.replicate_tracks(src_anchor_fp, self.saved_board.GetTracks(), self.dst_anchor_fp, self.net_pairs, layout_group, matched_layerIDs)
+
+        # replicate zones ADD MATCHED LAYER DICT
+        src_zones = [self.saved_board.GetArea(zone_id) for zone_id in range(self.saved_board.GetAreaCount()) ]
+        self.replicate_zones(src_anchor_fp, src_zones, self.dst_anchor_fp, self.net_pairs, layout_group, matched_layerIDs)
+
+        # replicate text
+        src_text = [item for item in self.saved_board.GetDrawings() if isinstance(item, pcbnew.PCB_TEXT)]
+        self.replicate_text(src_anchor_fp, src_text, self.dst_anchor_fp, layout_group)
+
+        # replicate drawings
+        source_dwgs = [item for item in self.saved_board.GetDrawings() if not isinstance(item, pcbnew.PCB_TEXT)]
+        self.replicate_drawings(src_anchor_fp, source_dwgs, self.dst_anchor_fp, layout_group)
+        pass
+
+    def match_layout(self, layout_file):
         logger.info("Loading saved design")
         # load saved design
         with open(layout_file, 'rb') as f:
@@ -665,12 +698,12 @@ class RestoreLayout:
         if saved_version > current_version:
             raise LookupError("Layout was saved with newer version of the plugin. This is not supported.")
 
-        # check layer count
-        if hasattr(data_saved, 'layer_count'):
-            if data_saved.layer_count < self.prj_data.board.GetCopperLayerCount():
-                raise LookupError("Target board has less layers than layers saved. This is not supported.")
-        else:
-            logger.info("Saved layout does not have copper layer count saved. Might result in unhandled issues.")
+        # check layer count --> Now handled by mapping used source layers to existing target layers
+        #if hasattr(data_saved, 'layer_count'):
+        #    if data_saved.layer_count > self.prj_data.board.GetCopperLayerCount():
+        #        raise LookupError("Target board has less layers than layers saved. This is not supported.")
+        #else:
+        #    logger.info("Saved layout does not have copper layer count saved. Might result in unhandled issues.")
 
         # get saved hierarchy
         source_level_filename = data_saved.level_filename
@@ -714,7 +747,7 @@ class RestoreLayout:
         logger.info("Destination hash is: " + repr(hex_hash))
 
         if not saved_hash == hex_hash:
-            raise ValueError("Source and destination schematics don't match!")
+            logger.info("Source and destination schematic hash don't match!")
 
         # save board from the saved layout only temporary
         tempdir = tempfile.gettempdir()
@@ -723,13 +756,13 @@ class RestoreLayout:
             f.write(data_saved.layout.encode('utf-8'))
 
         # restore layout data
-        saved_board = pcbnew.IO_MGR.Load(pcbnew.IO_MGR.KICAD_SEXP, temp_filename)
+        self.saved_board = pcbnew.IO_MGR.Load(pcbnew.IO_MGR.KICAD_SEXP, temp_filename)
         # delete temporary file
         os.remove(temp_filename)
 
         # get layout data from saved board
         logger.info("Get layout data from saved board")
-        saved_layout = PrjData(saved_board, dont_parse_schematics=True)
+        saved_layout = PrjData(self.saved_board, dont_parse_schematics=True)
 
         saved_fps = saved_layout.footprints
 
@@ -741,37 +774,41 @@ class RestoreLayout:
 
         # sort by ID - I am counting that source and destination sheet have been
         # annotated by KiCad in their final form (reset annotation and then re-annotate)
-        footprints_to_place = sorted(footprints_to_place, key=lambda x: (x.fp_id, x.ref))
-        saved_fps = sorted(saved_fps, key=lambda x: (x.fp_id, x.ref))
+        self.footprints_to_place = sorted(footprints_to_place, key=lambda x: (x.fp_id, x.ref))
+        self.saved_fps = sorted(saved_fps, key=lambda x: (x.fp_id, x.ref))
 
         # get the saved layout ID numbers and try to figure out a match (at least the same depth, ...)
         # find net pairs
-        net_pairs = self.get_net_pairs(footprints_to_place, saved_fps)
+        self.net_pairs = self.get_net_pairs(self.footprints_to_place, self.saved_fps)
 
-        # Create Group for placed components
-        layout_group = pcbnew.PCB_GROUP(self.board)
-        self.board.Add(layout_group)
 
-        # replicate modules
-        src_anchor_fp = saved_fps[footprints_to_place.index(self.dst_anchor_fp)]
-        self.replicate_footprints(src_anchor_fp, saved_fps, self.dst_anchor_fp, footprints_to_place, layout_group)
-
-        # replicate tracks
-        self.replicate_tracks(src_anchor_fp, saved_board.GetTracks(), self.dst_anchor_fp, net_pairs, layout_group)
-
-        # replicate zones
-        src_zones = [saved_board.GetArea(zone_id) for zone_id in range(saved_board.GetAreaCount()) ]
-        self.replicate_zones(src_anchor_fp, src_zones, self.dst_anchor_fp, net_pairs, layout_group)
-
-        # replicate text
-        src_text = [item for item in saved_board.GetDrawings() if isinstance(item, pcbnew.PCB_TEXT)]
-        self.replicate_text(src_anchor_fp, src_text, self.dst_anchor_fp, layout_group)
-
-        # replicate drawings
-        source_dwgs = [item for item in saved_board.GetDrawings() if not isinstance(item, pcbnew.PCB_TEXT)]
-        self.replicate_drawings(src_anchor_fp, source_dwgs, self.dst_anchor_fp, layout_group)
+        # Check Layers used by Zones and Tracks
+        saved_tracks = self.saved_board.GetTracks()
+        self.src_layers = []
+        for track in saved_tracks:
+            layer_name = track.GetLayerName()
+            if layer_name not in self.src_layers:
+                self.src_layers.append(layer_name)
+        logger.info("used Layers")
+        logger.info(self.src_layers)
+        
+        self.available_layers = []
+        i = pcbnew.PCBNEW_LAYER_ID_START
+        board_settings = self.board.GetDesignSettings()
+        while i < pcbnew.PCBNEW_LAYER_ID_START + pcbnew.PCB_LAYER_ID_COUNT:
+            layer_name = self.board.GetLayerName(i)
+            if '.Cu' in layer_name: 
+                if board_settings.IsLayerEnabled(i):
+                    self.available_layers.append(layer_name)
+            else:
+                break
+            i = i+1
+        logger.info("available Layers")
+        logger.info(self.available_layers)
+        
         pass
-
+        
+        
     @staticmethod
     def get_net_pairs(dst_fps, src_fps):
         """ find all net pairs between source sheet and current sheet"""
@@ -1028,10 +1065,9 @@ class RestoreLayout:
                 dst_text.SetKeepUpright(src_text.IsKeepUpright())
                 dst_text.SetVisible(src_text.IsVisible())             
             # Add Footprint to group
-            logger.info(dst_fp)
             layout_group.AddItem(dst_fp.fp)                                                                    
 
-    def replicate_tracks(self, src_anchor_fp, src_tracks, dst_anchor_fp, net_pairs, layout_group):
+    def replicate_tracks(self, src_anchor_fp, src_tracks, dst_anchor_fp, net_pairs, layout_group, matched_layers):
         logger.info("Replicating tracks")
 
         # get anchor footprint
@@ -1076,12 +1112,14 @@ class RestoreLayout:
                 else:
                     new_track.Rotate(dst_anchor_fp_position, delta_orientation)
                     pass
-
+                layer = track.GetLayer()
+                new_layer = matched_layers[layer]
+                new_track.SetLayer(new_layer)
                 self.board.Add(new_track)
                 #includes Tracks in Group
                 layout_group.AddItem(new_track)                                           
 
-    def replicate_zones(self, src_anchor_fp, src_zones, dst_anchor_fp, net_pairs, layout_group):
+    def replicate_zones(self, src_anchor_fp, src_zones, dst_anchor_fp, net_pairs, layout_group, matched_layers):
         """ method which replicates zones"""
         logger.info("Replicating zones")
 
@@ -1140,6 +1178,11 @@ class RestoreLayout:
                 new_zone.Rotate(dst_anchor_fp_position, -rot_angle)
             else:
                 new_zone.Rotate(dst_anchor_fp_position, delta_orientation)
+            
+            layer = zone.GetLayer()
+            new_layer = matched_layers[layer]
+            new_zone.SetLayer(new_layer)
+            
             self.board.Add(new_zone)
             # Add Zone to Group
             layout_group.AddItem(new_zone)                                                      

@@ -28,6 +28,7 @@ import sys
 from .save_layout_dialog_GUI import SaveLayoutDialogGUI
 from .initial_dialog_GUI import InitialDialogGUI
 from .error_dialog_GUI import ErrorDialogGUI
+from .sort_layers_GUI import SortLayersDialogGUI
 
 from .save_restore_layout import SaveLayout
 from .save_restore_layout import RestoreLayout
@@ -103,6 +104,103 @@ class SaveRestoreDialog(SaveLayoutDialogGUI):
         self.hl_fps = []
         self.hl_items = []
         pcbnew.Refresh()
+
+class SortLayersDialog(SortLayersDialogGUI):
+    def SetSizeHints(self, sz1, sz2):
+        # DO NOTHING
+        pass
+        
+    def __init__(self, parent, src_layers, dest_layers, logger):
+        super(SortLayersDialog, self).__init__(parent)
+        self.logger = logger
+        self.selectedDest = 0
+        self.selectedSource = 0
+        
+        self.src_layers = src_layers
+        self.dest_layers = dest_layers
+        self.matched_layers = {}  # key = src layer, value = dest layer
+        
+        matches = set(src_layers).intersection(dest_layers)
+        for match in matches: 
+            self.src_layers.remove(match)
+            self.dest_layers.remove(match)
+            self.matched_layers[match] = match
+            
+
+
+        self.update_matches()
+        self.update_sources()
+        self.update_destinations()
+
+
+    def src_selected( self, event ):
+        self.selectedSource = self.src_layers[self.list_src_layers.GetSelection()]
+        self.logger.info(self.selectedSource)
+        event.Skip()
+
+    def dest_selected( self, event ):
+        self.selectedDest = self.dest_layers[self.list_dest_layers.GetSelection()]
+        self.logger.info(self.selectedDest)
+        event.Skip()
+
+    def match_selected(self,event):
+        self.selectedMatch = self.list_matches.GetSelection()
+        event.Skip()
+
+    def match_items( self, event ):
+        if self.selectedDest and self.selectedSource:
+            self.matched_layers[self.selectedSource] = self.selectedDest
+            
+            self.src_layers.remove(self.selectedSource)
+            self.dest_layers.remove(self.selectedDest)
+            self.update_matches()
+            self.update_sources()
+            self.update_destinations()
+            self.logger.info(self.matched_layers)
+            self.selectedDest = 0
+            self.selectedSource = 0
+            
+        event.Skip()
+
+    def unmatch_items(self,event):
+        if self.match_items:
+            match_to_delete = self.list_matches.GetString(self.selectedMatch)
+            match_src,match_dest = match_to_delete.split("-->")
+            self.matched_layers.pop(match_src)
+            self.src_layers.append(match_src)
+            self.dest_layers.append(match_dest)
+            self.update_matches()
+            self.update_sources()
+            self.update_destinations()
+        event.Skip()
+
+    def update_matches(self):
+        self.list_matches.Clear()
+        if self.matched_layers:
+            for key,value in self.matched_layers.items():
+                self.list_matches.Append(key + "-->" + value)
+
+    def update_sources(self):
+        self.list_src_layers.Clear()
+        if self.src_layers:
+            self.list_src_layers.Set(self.src_layers)
+
+    def update_destinations(self):
+        self.list_dest_layers.Clear()
+        if self.dest_layers:
+            self.list_dest_layers.Set(self.dest_layers)
+
+    def cancel_restore( self, event ):
+        
+        event.Skip()
+        self.EndModal(0)
+
+    def continue_restore( self, event ):
+        self.EndModal(1)
+        event.Skip()
+    def get_matches(self):
+        return self.matched_layers
+
 
 
 class SaveRestoreLayout(pcbnew.ActionPlugin):
@@ -285,9 +383,10 @@ class SaveRestoreLayout(pcbnew.ActionPlugin):
                 logging.shutdown()
                 return
 
-            # run the main backend
+            # split restore operation to allow user input
+            # First match the layouts and check for compatibility
             try:
-                restore_layout.restore_layout(layout_file)
+                restore_layout.match_layout(layout_file)
             except (ValueError, LookupError) as error:
                 caption = 'Save/Restore Layout'
                 message = str(error)
@@ -308,5 +407,37 @@ class SaveRestoreLayout(pcbnew.ActionPlugin):
                 dlg.Destroy()
                 logging.shutdown()
                 return
+            
+            # open user dialog for layer mapping    
+            dlg = SortLayersDialog(self.frame, restore_layout.src_layers, restore_layout.available_layers, logger)
+            res = dlg.ShowModal()
+            matched_layers= dlg.get_matches()
+            
+            dlg.Destroy()
+            logger.info(matched_layers)
+            # run the final restore action     
+            try:
+                restore_layout.restore_layout(matched_layers)
+            except (ValueError, LookupError) as error:
+                caption = 'Save/Restore Layout'
+                message = str(error)
+                dlg = wx.MessageDialog(self.frame, message, caption, wx.OK | wx.ICON_EXCLAMATION)
+                dlg.ShowModal()
+                dlg.Destroy()
+                logger.exception("Error when restoring layout")
+                logging.shutdown()
+                return
+            except Exception:
+                logger.exception("Fatal error when restoring layout")
+                caption = 'Save/Restore Layout'
+                message = "Fatal error when restoring layout.\n" \
+                          + "You can raise an issue on GiHub page.\n" \
+                          + "Please attach the save_restore_layout.log which you should find in the project folder."
+                dlg = wx.MessageDialog(self.frame, message, caption, wx.OK | wx.ICON_ERROR)
+                dlg.ShowModal()
+                dlg.Destroy()
+                logging.shutdown()
+                return
+             
             logging.shutdown()
             return

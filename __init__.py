@@ -21,8 +21,8 @@ except Exception as e:
         Notify user of error when initializing the plugin
         """
         def defaults(self):
-            self.name = "SaveRestoreLayout"
-            self.category = "Save Restore Layout"
+            self.name = "SaveRestoreLayout_2.0 Dev"
+            self.category = "Save Restore Layout2.0 Dev"
             self.description = "Replicates layout from one sheet to other sheets in multiple sheet schematics"
 
         def Run(self):
